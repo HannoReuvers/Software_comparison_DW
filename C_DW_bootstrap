@@ -1,0 +1,115 @@
+#include <iostream>
+#include <algorithm>
+#include <Accelerate/Accelerate.h>
+#include <Eigen/Dense>
+#include <random>
+#include <math.h>
+#include <ctime>
+using namespace Eigen;
+using namespace std;
+
+double DurbinWatson(const Ref<const VectorXd>& a)
+{
+    long n = a.rows();
+    double sum1= pow(a(0),2), sum2=0;
+    for (int i=1; i<n; ++i){
+        sum1 = sum1+pow(a(i),2);
+        sum2 = sum2+pow(a(i)-a(i-1),2);
+    }
+    return sum2/sum1;
+}
+
+int main()
+{
+    const int T = 500;                  // Sample size
+    const int B = 499;                  // Number of bootstrap replicates
+    const int Nsim= 1000;
+    const int presample = 50;
+    clock_t t1, t2;
+    
+    
+    // Generate signal
+    MatrixXd mX(T,2);
+    Vector2d beta(1, 2);
+    VectorXd signal(T);
+    mX.col(0) = ArrayXd::Constant(T,1,1);
+    for (int i=0; i<T; ++i){ mX(i,1) = sin(0.5*M_PI*(i+1)); }
+    signal = mX*beta;
+    
+    // For random number generation
+    default_random_engine generator(time(0));
+    normal_distribution<double> gaussianRV(0.0,1.0);
+    uniform_int_distribution<int> unifRV(0,T-2);
+    auto normal = [&] (double) {return gaussianRV(generator);};
+    
+    int points =21;
+    double theta;
+    VectorXd thetalist(points);
+    thetalist = VectorXd::LinSpaced(points,0.0,0.5);
+    
+    t1= clock();
+    MatrixXd reject_list = MatrixXd::Zero(points,Nsim);
+    for (int thetaiter=0; thetaiter<points; ++thetaiter)
+    {
+        cout << thetaiter << "\n";
+        theta = thetalist(thetaiter);
+        for (int MCiter=0; MCiter<Nsim; ++MCiter)
+        {
+            // Compute AR(1) innovations
+            VectorXd eta_t = VectorXd::NullaryExpr(T+presample, normal );
+            VectorXd utemp_t(T+presample);
+            utemp_t(0) = eta_t(0);
+            for (int titer=1; titer<T+presample; ++titer) { utemp_t(titer) = theta*utemp_t(titer-1)+eta_t(titer); }
+            VectorXd u_t(T);
+            u_t = utemp_t.tail(T);
+            
+            // Estimate model
+            VectorXd vy(T), uhat_t(T), resid(T-1), fit(T);
+            Vector2d betahat;
+            vy = signal+u_t;
+            betahat = (mX.transpose() * mX).ldlt().solve(mX.transpose() * vy);
+            fit = mX*betahat;
+            uhat_t = vy-fit;
+            double DW = DurbinWatson(uhat_t);
+            double rhohat = (uhat_t.head(T-1)).dot(uhat_t.tail(T-1)) / (uhat_t.dot(uhat_t));
+            resid = uhat_t.tail(T-1)- rhohat*uhat_t.head(T-1);
+            
+            // Bootstrap
+            double DW_star[B];
+            VectorXd bootstrap_errors(T), vy_star(T), resid_star(T);
+            Vector2d betahat_star;
+            for (int biter=0; biter<B; ++biter)
+            {
+                for (int iter=0; iter<T; ++iter){ bootstrap_errors(iter) = resid(unifRV(generator)); }
+                vy_star= fit+bootstrap_errors;
+                betahat_star= (mX.transpose() * mX).ldlt().solve(mX.transpose() * vy_star);
+                resid_star= vy_star-mX*betahat_star;
+                DW_star[biter] = DurbinWatson(resid_star);
+            }
+            
+            // Evaluate hypothesis test
+            sort(DW_star,DW_star+B);
+            int index_low = (int)(0.025*B), index_high = (int)(0.975*B);
+            double crit_low, crit_high;
+            crit_low= 0.5*(DW_star[index_low]+DW_star[index_low+1]);        // Linearly interpolated critical value
+            crit_high= 0.5*(DW_star[index_high]+DW_star[index_high+1]);     // Linearly interpolated critical value
+            
+            if (DW < crit_low)
+            {
+                reject_list(thetaiter,MCiter) = 1;
+            }
+            else if (DW > crit_high)
+            {
+                reject_list(thetaiter,MCiter) = 1;
+            }
+        }
+        
+    }
+    t2= clock();
+    
+    float mytime ((float)t2-(float)t1);
+    float seconds = mytime / CLOCKS_PER_SEC;
+    
+    cout << seconds << "\n\n";
+    cout << reject_list.rowwise().mean() << "\n";
+}
